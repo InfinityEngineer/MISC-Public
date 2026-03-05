@@ -1,99 +1,73 @@
 # Dell OptiPlex 9010 - Next Steps (for Claude Code on the 9010)
 
-## Status as of 2026-03-05 — ROOT CAUSE FOUND
+## Status as of 2026-03-05 — CSM MUST BE DISABLED VIA F2 MENU
 
 **CSM (Compatibility Support Module) defaults to ON after CMOS reset, which conflicts with Above 4G Decoding.**
 
-The xCuri0 ReBarUEFI wiki explicitly states: "CSM is off otherwise you might face issues such as black screen or unable to enter BIOS."
+The xCuri0 wiki states: "CSM is off otherwise you might face issues such as black screen."
+The Dell 7010 guide says: "Disable Legacy Boot options" and "Set your bios to use uefi boot" — done through the F2 BIOS menu, NOT setup_var.
 
-### Root cause confirmed:
-- "Launch CSM" is at `setup_var 0xBDE` (IFR OneOf, VarStore 2)
-- Default value after CMOS reset: `0x00` = **"Always"** (CSM ON)
-- CSM ON + Above 4G Decoding ON = **black screen** (CSM expects all memory below 4GB)
-- First time 4G worked because CSM was already OFF from pre-CMOS-reset config
-
-### IFR values for "Launch CSM" (offset 0xBDE):
-| Value | Meaning | Notes |
-|-------|---------|-------|
-| `0x00` | Always | CSM always launches — **DEFAULT after CMOS reset** |
-| `0x01` | Auto | Based on OS detection |
-| `0x02` | Never | CSM disabled — **REQUIRED for 4G Decoding** |
+### IMPORTANT: Do NOT use setup_var for CSM!
+- CSM's IFR VarStore (ID=2) is from the CSMCORE module and maps to a DIFFERENT NVRAM variable than the "Setup" variable that `setup_var` writes to
+- `setup_var 0xBDE 0x02` writes to the WRONG variable — it corrupts byte 3038 of the Setup variable instead of changing CSM
+- CSM must be disabled through the **Dell BIOS F2 menu** (Boot tab → UEFI boot mode)
 
 ---
 
-## IMMEDIATE FIX: Two setup_var Commands
+## CORRECT PROCEDURE
 
-After CMOS reset, boot modGRUBShell from USB and run BOTH commands:
+### Step 1: CMOS Reset
+Full Dell standby power procedure:
+1. Shut down, unplug cord, hold power 15-20s
+2. Move jumper from PSWD to RTCRST
+3. **Plug cord back in** (don't press power), wait 10s
+4. Unplug, press power once, move jumper back to PSWD
+5. Plug in, power on
 
-```
-setup_var 0xBDE 0x02
-setup_var 0x2 0x1
-```
+### Step 2: Configure BIOS Settings (F2)
+On boot, press F2 to enter BIOS Setup. Configure:
 
-This sets:
-1. CSM = Never (disabled) — offset 0xBDE = 0x02
-2. Above 4G Decoding = Enabled — offset 0x2 = 0x01
+1. **Boot tab** → Set boot mode to **UEFI** (not Legacy) — this disables CSM
+2. **Boot tab** → Set boot sequence to include the NVMe drive
+3. **Secure Boot** → **OFF** (should be off by default)
+4. **Save and Exit**
 
-Then reboot. The system should boot to Windows with 4G Decoding working.
+### Step 3: Enable Above 4G Decoding (modGRUBShell)
+1. Boot from USB with modGRUBShell (F12 boot menu)
+2. Run: `setup_var 0x2 0x1`
+3. Reboot
 
-**Important:** Both commands must be set before rebooting. Setting only 4G without disabling CSM first = black screen.
+### Step 4: Verify
+- System should boot to Windows with 4G Decoding enabled
+- Open GPU-Z → Advanced tab → "Above 4G Decode enabled in BIOS" = YES
 
----
-
-## THEN: Enable Resizable BAR
-
-Once the system boots with 4G Decoding working:
-
-### Step 1: Run ReBarState.exe
-
-1. Open **cmd** or **PowerShell as Administrator**
-2. Navigate to:
-   ```
-   cd C:\Users\clayi\Desktop\9010_BIOS_BACKUP
-   ```
-3. Run:
-   ```
-   ReBarState.exe
-   ```
-4. Enter `32` when prompted (unlimited BAR size)
-
-### Step 2: Reboot
-
-Boot may take a couple extra seconds (WarmBootPei patch forces full PCI enumeration — expected).
-
-### Step 3: Verify with GPU-Z
-
-- "Above 4G Decode enabled in BIOS" → **YES**
-- "Resizable BAR" → should now show **Enabled**
+### Step 5: Enable Resizable BAR
+1. Open cmd/PowerShell as Administrator
+2. `cd C:\Users\clayi\Desktop\9010_BIOS_BACKUP`
+3. Run `ReBarState.exe`, enter `32` (unlimited)
+4. Reboot
+5. GPU-Z → Resizable BAR should show **Enabled**
 
 ---
 
-## FUTURE: Build Script Update Needed
+## What Went Wrong Previously
 
-The build script (`build_rebar.pl`) should be updated to also change the CSM IFR default from "Always" (0x00) to "Never" (0x02). This way CMOS resets will default to CSM OFF + 4G ON, and no setup_var commands will be needed at all.
+| Attempt | Result | Why |
+|---------|--------|-----|
+| `setup_var 0x2 0x1` (first time, CSM already OFF) | Worked! | CSM was OFF from pre-CMOS-reset config |
+| CMOS reset + `setup_var 0x2 0x1` only | Black screen | CMOS reset re-enabled CSM (Legacy boot) |
+| `setup_var 0xBDE 0x02` + `setup_var 0x2 0x1` | Worse (no HDD activity) | 0xBDE wrote to wrong NVRAM variable, corrupting an unrelated setting |
 
-This requires patching the OneOf option Flags in the IFR:
-- "Always" option at its Flags byte: remove DEFAULT flag (0x30 → 0x20)
-- "Never" option at its Flags byte: add DEFAULT flag (0x00 → 0x10)
-
-This will be done on the Razer in the next build session.
+The key insight: CSM/Legacy boot must be disabled through the F2 BIOS menu, not setup_var. The 7010 guide does this as a prerequisite before any setup_var commands.
 
 ---
 
 ## Recovery
 
 If stuck in black screen / no boot:
-
-1. CMOS reset (Dell standby power procedure):
-   - Shut down, unplug cord, hold power 15-20s
-   - Move jumper from PSWD to RTCRST
-   - **Plug cord back in** (don't press power), wait 10s
-   - Unplug, press power once, move jumper back to PSWD
-   - Plug in, power on
-
-2. This clears ALL NVRAM (including 4G and CSM) → system boots normally
-
-3. Then re-apply both setup_var commands via modGRUBShell
+1. CMOS reset (see Step 1 above)
+2. This clears ALL NVRAM → system boots normally
+3. Then follow Steps 2-5 in order
 
 ---
 
@@ -109,3 +83,7 @@ If stuck in black screen / no boot:
 | `build_rebar.pl` | Build script (run on Razer with CH341A) |
 | `spi1_rebar_write.bin` | 4MB chip image (for reflashing if needed) |
 | `spi2_rebar_write.bin` | 8MB chip image (for reflashing if needed) |
+
+## Future Build Script Update
+- Change CSM IFR default from "Always" to "Never" — but this requires finding the correct VarStore and NVRAM variable for CSMCORE, which is more complex than initially thought
+- May not be worth it if the F2 menu approach works reliably
