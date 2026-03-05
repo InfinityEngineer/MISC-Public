@@ -11,9 +11,9 @@ These were developed with Claude Code (Anthropic's CLI agent) doing binary analy
 | NVMe Boot | Working |
 | F1 Fan Failure Bypass | Working |
 | Above 4G Decoding | **Working** (survives warm reboots!) |
-| Resizable BAR (ReBAR) | **Pending** — need to run `ReBarState.exe` |
+| Resizable BAR (ReBAR) | **Working** (GPU-Z confirmed!) |
 
-The RTX 4060 8GB is confirmed by GPU-Z to have hardware ReBAR support and Above 4G Decoding enabled in BIOS. Only the final `ReBarState.exe` step remains.
+All features confirmed working with RTX 4060 8GB. ReBAR enabled via `ReBarState.exe` with BAR size 32 (unlimited).
 
 ## Hardware Setup
 
@@ -91,9 +91,14 @@ BIOS[0x200000-0x5FFFFF] -> 4MB chip at offset 0x000000
 | A | +0x199B | `Store(16GB, M2LN)` → `Store(0xFFFFFFFFF, M2MX)` — expand to 64GB ceiling |
 | B | +0x19CF | `M2MX=(M2MN+M2LN)-1` → `M2LN=(M2MX-M2MN)+1` — reverse calculation |
 
-**IFR Default (in Setup FFS at FV1 0x3F2E54):**
-- CheckBox at FV1 0x45ACCA, Flags byte at 0x45ACD6: `0x00` → `0x01`
-- Makes "Above 4G Decoding" default to Enabled after CMOS reset
+**IFR Defaults (in Setup FFS at FV1 0x3F2E54):**
+- Above 4G Decoding: CheckBox at FV1 0x45ACCA, Flags byte at 0x45ACD6: `0x00` → `0x01` (default Enabled)
+- CSM defaults (all OneOf, move DEFAULT flag to UEFI-only option):
+  - Launch CSM: fv1 0x456FB3 (remove DEFAULT) / 0x456FC1 (add DEFAULT to "Never")
+  - Boot option filter: fv1 0x456FFF / 0x45701B ("UEFI only")
+  - PXE OpROM: fv1 0x457051 / 0x45705F ("UEFI only")
+  - Storage OpROM: fv1 0x4570BF / 0x4570B1 ("UEFI only")
+  - Video OpROM: fv1 0x457111 / 0x457103 ("UEFI only")
 
 **FV_BB (uncompressed, on 4MB chip):**
 - WarmBootPei at BIOS 0x570A00: `75 12` (JNE) → `EB 12` (JMP) at 0x570CBB
@@ -116,6 +121,8 @@ This was the hardest problem to solve. Enabling Above 4G Decoding would work on 
 2. **WarmBootPei (PEI module)**: A 912-byte PEI module checks for a `_WB_` (Warm Boot) marker in BIOS data area memory (address 0x40E). When found, it calls a PPI to signal warm boot, which triggers `BOOT_ASSUMING_NO_CONFIGURATION_CHANGES` mode. **Fix:** JNE→JMP at BIOS 0x570CBB — the warm boot handler never triggers.
 
 3. **PciHostBridge DXE**: In `BOOT_ASSUMING_NO_CONFIGURATION_CHANGES` mode, PciHostBridge skips full 64-bit MMIO allocation. The GPU's above-4G BAR isn't allocated, display initialization fails, black screen.
+
+4. **CSM sub-options (post-CMOS reset)**: After CMOS reset, five hidden CSM settings default to Legacy mode: Launch CSM=Always, Boot option filter=UEFI+Legacy, Video/Storage OpROM=Legacy, PXE OpROM=Do not launch. Legacy Video OpROM + Above 4G Decoding = black screen at POST. **Fix:** `setup_var` commands to set all 5 CSM settings to UEFI-only + IFR default patches in build script (Step 3d).
 
 ### What We Tried (and Ruled Out)
 
@@ -242,10 +249,20 @@ flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_rebar_write.bin
 
 ### Post-Flash
 
-1. CMOS reset (IFR patch makes 4G Decoding default to ON)
-2. Boot to Windows
-3. Run `ReBarState.exe`, set BAR size to `32` (unlimited)
-4. Reboot, verify with GPU-Z → Advanced tab → Resizable BAR
+1. CMOS reset (IFR patches make 4G Decoding and CSM settings default correctly)
+2. Boot modGRUBShell from USB (F12 → UEFI: USB)
+3. Run setup_var commands (needed even with IFR patches if NVRAM existed before):
+   ```
+   setup_var 0x2F 0x02     # Video OpROM = UEFI only
+   setup_var 0x2E 0x02     # Storage OpROM = UEFI only
+   setup_var 0x2D 0x02     # PXE OpROM = UEFI only
+   setup_var 0xBDF 0x02    # Boot option filter = UEFI only
+   setup_var 0xBDE 0x02    # Launch CSM = Never
+   setup_var 0x2 0x1       # Above 4G Decoding = Enabled
+   ```
+4. Reboot → Boot to Windows
+5. Run `ReBarState.exe`, set BAR size to `32` (unlimited)
+6. Reboot, verify with GPU-Z → Advanced tab → Resizable BAR
 
 ---
 
@@ -299,6 +316,12 @@ flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_rebar_write.bin
 13. **Dell BIOS .exe files use PFS format** — extract with biosutilities DellPfsExtract.
 
 14. **UEFITool can silently displace fixed-location modules** — always inject into FREE SPACE.
+
+15. **CSM sub-options (Video/Storage OpROM) default to Legacy after CMOS reset** — not just "Launch CSM", ALL sub-options must be UEFI-only.
+
+16. **CSM ON + Above 4G Decoding ON = black screen** (POST level failure) — Legacy Video OpROM conflicts with 64-bit MMIO.
+
+17. **All CSM settings are in VarStore 2**, accessible via `setup_var` at offsets 0x2D-0x2F (OpROM policies), 0xBDE (Launch CSM), 0xBDF (Boot option filter).
 
 ---
 

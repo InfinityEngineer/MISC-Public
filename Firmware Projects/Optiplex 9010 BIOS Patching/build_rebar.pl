@@ -19,14 +19,16 @@
 #   9. PciBus (IvyUSB3): Add Intel 7 Series XHCI to 64-bit blacklist
 #   DSDT: Bypass E4GM gate + expand 64-bit MMIO to 36-bit ceiling (in AmiBoardInfo)
 #   IFR: Change "Above 4G Decoding" default from Disabled to Enabled (in Setup)
+#   IFR: Change CSM defaults: Launch CSM=Never, OpROMs=UEFI only (in Setup)
 # FV_BB (uncompressed, 4MB chip):
 #   WarmBootPei: Disable warm boot detection (skip _WB_ marker check)
 #
 # === POST-FLASH STEPS ===
-# 1. CMOS reset (IFR default change makes 4G Decoding default to ON)
-# 2. Boot Windows, run ReBarState.exe, set BAR size to 32
-# 3. Reboot, verify with GPU-Z
-# Note: setup_var 0x2 0x1 is no longer needed — CMOS reset enables 4G by default
+# 1. CMOS reset (IFR defaults: 4G=ON, CSM=Never, OpROMs=UEFI only)
+# 2. Boot modGRUBShell, run: setup_var 0x2 0x1 (enable 4G in NVRAM)
+#    Also run CSM setup_vars if needed (see NEXT_STEPS.md for full list)
+# 3. Boot Windows, run ReBarState.exe, set BAR size to 32
+# 4. Reboot, verify with GPU-Z
 #
 # === CMOS RECOVERY ===
 # If no display: Dell CMOS reset requires STANDBY POWER during RTCRST.
@@ -304,6 +306,63 @@ substr($fv1, $ifr_flags_off, 1, chr(0x01));
 printf "  [IFR] Above 4G Decoding default: Disabled -> Enabled @ fv1 0x%06X\n", $ifr_flags_off;
 
 $modified_modules{Setup} = 1;
+
+# ===================================================================
+# Step 3d: Change CSM IFR defaults to UEFI-only (in Setup)
+# ===================================================================
+# After CMOS reset, CSM sub-options default to Legacy mode which conflicts
+# with Above 4G Decoding (black screen). Dell's F2 menu only exposes
+# "Enable Legacy Option ROMs" and "Boot List Option" — the sub-options
+# (Video/Storage/PXE OpROM policies) are hidden and stay at Legacy defaults.
+#
+# All settings are in VarStore 2 (CSMCORE). Confirmed accessible via setup_var.
+#
+# Patch each OneOf by moving the DEFAULT flag (bit 0x10) from the old default
+# option to the desired option. Also clear MFG_DEFAULT (bit 0x20) where present.
+print "\nApplying CSM IFR default patches (Setup)...\n";
+
+my @csm_patches = (
+    # [name, remove_default_fv1_off, old_flags, new_flags, add_default_fv1_off, old_flags2, new_flags2]
+    ["Launch CSM: Always->Never",
+     0x456FB3, 0x30, 0x20,   # Remove DEFAULT from "Always" (val=0x00)
+     0x456FC1, 0x00, 0x10],  # Add DEFAULT to "Never" (val=0x02)
+
+    ["Boot option filter: UEFI+Legacy->UEFI only",
+     0x456FFF, 0x30, 0x20,   # Remove DEFAULT from "UEFI and Legacy" (val=0x00)
+     0x45701B, 0x00, 0x10],  # Add DEFAULT to "UEFI only" (val=0x02)
+
+    ["PXE OpROM: Do not launch->UEFI only",
+     0x457051, 0x30, 0x20,   # Remove DEFAULT from "Do not launch" (val=0x00)
+     0x45705F, 0x00, 0x10],  # Add DEFAULT to "UEFI only" (val=0x02)
+
+    ["Storage OpROM: Legacy->UEFI only",
+     0x4570BF, 0x30, 0x20,   # Remove DEFAULT from "Legacy only" (val=0x01)
+     0x4570B1, 0x00, 0x10],  # Add DEFAULT to "UEFI only" (val=0x02)
+
+    ["Video OpROM: Legacy->UEFI only",
+     0x457111, 0x30, 0x20,   # Remove DEFAULT from "Legacy only" (val=0x01)
+     0x457103, 0x00, 0x10],  # Add DEFAULT to "UEFI only" (val=0x02)
+);
+
+for my $p (@csm_patches) {
+    my ($name, $rm_off, $rm_old, $rm_new, $add_off, $add_old, $add_new) = @$p;
+
+    # Verify and patch: remove DEFAULT from old default
+    my $cur_rm = ord(substr($fv1, $rm_off, 1));
+    die "CSM IFR ($name): expected flags 0x${\sprintf('%02X',$rm_old)} at remove offset, got 0x${\sprintf('%02X',$cur_rm)}"
+        unless $cur_rm == $rm_old;
+    substr($fv1, $rm_off, 1, chr($rm_new));
+
+    # Verify and patch: add DEFAULT to new default
+    my $cur_add = ord(substr($fv1, $add_off, 1));
+    die "CSM IFR ($name): expected flags 0x${\sprintf('%02X',$add_old)} at add offset, got 0x${\sprintf('%02X',$cur_add)}"
+        unless $cur_add == $add_old;
+    substr($fv1, $add_off, 1, chr($add_new));
+
+    printf "  [CSM] %-45s @ fv1 0x%06X / 0x%06X\n", $name, $rm_off, $add_off;
+}
+
+# No need to mark a new module — these are all inside Setup which is already marked
 
 # ===================================================================
 # Step 4: Fix FFS checksums for modified modules
