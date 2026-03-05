@@ -25,12 +25,24 @@ Full Dell standby power procedure:
 5. Plug in, power on
 
 ### Step 2: Configure BIOS Settings (F2)
-On boot, press F2 to enter BIOS Setup. Configure:
+On boot, press F2 to enter BIOS Setup. Configure ALL of these:
 
-1. **Boot tab** → Set boot mode to **UEFI** (not Legacy) — this disables CSM
-2. **Boot tab** → Set boot sequence to include the NVMe drive
-3. **Secure Boot** → **OFF** (should be off by default)
-4. **Save and Exit**
+1. **Boot tab** → **Boot List Option** = **UEFI** (not Legacy)
+2. **Boot tab** → **Enable Legacy Option ROMs** = **UNCHECKED / DISABLED**
+   - This is THE critical setting — it's separate from Boot List Option!
+   - When enabled, Video/Storage OpROMs load in Legacy mode which conflicts with 4G
+   - The Dell BIOS string says: "This option is required for Legacy boot mode and is not allowed if Secure Boot is enabled"
+3. **Boot tab** → Set boot sequence to include the NVMe drive
+4. **Secure Boot** → **OFF**
+5. **Save and Exit**
+
+**Why "Enable Legacy Option ROMs" matters:**
+The CSM sub-options default to Legacy mode after CMOS reset:
+- "Launch Video OpROM policy" defaults to **Legacy only**
+- "Launch Storage OpROM policy" defaults to **Legacy only**
+- These cause the GPU's Option ROM to load in Legacy mode
+- Legacy Video OpROM + Above 4G Decoding = black screen
+- Disabling Legacy Option ROMs forces everything to UEFI mode
 
 ### Step 3: Enable Above 4G Decoding (modGRUBShell)
 1. Boot from USB with modGRUBShell (F12 boot menu)
