@@ -41,7 +41,7 @@
 use strict;
 use warnings;
 
-my $base_file      = "F1_BYPASS_V4.BIN";
+my $base_file      = "F1_BYPASS.BIN";    # Output of build_f1_bypass.pl
 my $rebar_ffs_file = "ReBarDxe.ffs";
 my $spi2_dump_file = "spi2_preflight_read1.bin";  # Fresh 8MB dump (do a new read before flashing!)
 my $output_bios    = "REBAR.BIN";

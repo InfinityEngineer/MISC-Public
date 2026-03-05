@@ -1,74 +1,82 @@
 #!/usr/bin/perl
-# build_f1_bypass.pl - Build Dell OptiPlex 9010 BIOS with F1 bypass
+# build_f1_bypass.pl - Build Dell OptiPlex 9010 BIOS with NVMe + F1 bypass
 #
-# Patches the DellErrorLogConfig DXE driver to return EFI_SUCCESS immediately
+# Patches the DellErrorLogConfig DXE driver to return SUCCESS immediately
 # on entry, disabling the "Alert! Previous fan failure / Press F1" POST screen.
+# Also injects NVMe driver for NVMe boot support.
 #
-# The driver (GUID 038CE287-B806-45B6-A819-514DAF4B91B9) lives inside a
-# LZMA-compressed firmware volume (FV2) at BIOS offset 0x1D6AC9.
-#
-# The patch:
+# The DellErrorLogConfig driver lives inside a LZMA-compressed firmware volume
+# (FV2) at BIOS offset 0x1D6AC9. The patch:
 #   1. Changes the driver entry point to: xor eax, eax; ret (return SUCCESS)
 #   2. Zeros out the dead .text code and .data string sections
 #   3. Recompresses with LZMA (zeroed data compresses smaller -> fits!)
-#   4. Fixes the LZMA header (xz writes wrong uncompressed size)
-#   5. Replaces the LZMA stream in the BIOS image
-#   6. Updates all FFS checksums
-#   7. Generates write images for BOTH flash chips
+#   4. Replaces the LZMA stream in the BIOS image
+#   5. Updates all FFS checksums
 #
-# IMPORTANT: The LZMA stream spans both the 8MB and 4MB flash chips!
-#   BIOS[0x000000-0x1FFFFF] -> 8MB chip (MX25L6406E) at chip offset 0x600000
-#   BIOS[0x200000-0x5FFFFF] -> 4MB chip (MX25L3206E) at chip offset 0x000000
-#   The LZMA starts at 0x1D6AC9 (on 8MB chip) and ends at 0x2E6BB6 (on 4MB chip).
-#   You MUST flash both chips or the LZMA stream will be half-old/half-new = brick.
+# Base: BACKUP.BIN (stock Dell OptiPlex 9010 A30 BIOS, 6MB)
+# Requires: NvmExpressDxe.ffs (NVMe DXE driver, 6024 bytes)
+# Output: F1_BYPASS.BIN (6MB BIOS), spi1_f1bypass_write.bin (4MB chip),
+#         spi2_f1bypass_write.bin (8MB chip, requires fresh 8MB dump)
 #
-# Prerequisites:
-#   - xz (for LZMA compression/decompression)
-#   - flashrom + CH341A programmer
-#   - NVME_ONLY.BIN: stock Dell A30 BIOS with NVMe driver injected
-#   - A fresh dump of the 8MB chip (for preserving NVRAM/ME/IFD)
+# The F1 bypass is in FV2 (compressed, spans both chips) — both must be flashed.
 #
-# Usage:
-#   perl build_f1_bypass.pl [8mb_chip_dump.bin]
-#
-#   If 8mb_chip_dump.bin is provided, generates the 8MB write image too.
-#   Otherwise only generates the 6MB BIOS and 4MB chip image.
-#
-# Flash procedure:
-#   1. Clip to 8MB chip: flashrom -p ch341a_spi -c "MX25L6406E/MX25L6408E" -w spi2_f1bypass_write.bin
-#   2. Clip to 4MB chip: flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_f1bypass_write.bin
-#   3. Power on, enter BIOS Setup (F2) to verify boot order
-#
-# Recovery:
-#   Flash your original chip dumps back to both chips.
+# Recovery: flash original chip backups to restore stock
 
 use strict;
 use warnings;
 
-my $spi2_dump = $ARGV[0];  # optional 8MB chip dump
+my $base_file      = "BACKUP.BIN";
+my $nvme_ffs_file  = "NvmExpressDxe.ffs";
+my $spi2_dump_file = "spi2_preflight_read1.bin";  # Fresh 8MB dump
+my $output_bios    = "F1_BYPASS.BIN";
+my $output_4mb     = "spi1_f1bypass_write.bin";
+my $output_8mb     = "spi2_f1bypass_write.bin";
 
-my $base_file    = "NVME_ONLY.BIN";
-my $output_bios  = "F1_BYPASS.BIN";
-my $output_4mb   = "spi1_f1bypass_write.bin";
-my $output_8mb   = "spi2_f1bypass_write.bin";
+my $BIOS_SIZE      = 6291456;     # 6MB
+my $SPI2_BIOS_OFF  = 0x600000;    # BIOS region offset in 8MB chip
+my $NVME_FFS_OFF   = 0x3564B0;    # NVMe injection point
+my $NVME_FFS_SIZE  = 6024;
 
-# --- Step 1: Read base BIOS ---
+# ===================================================================
+# Step 1: Read base BIOS
+# ===================================================================
+print "=" x 60, "\n";
+print "F1 Bypass + NVMe Build for Dell OptiPlex 9010\n";
+print "=" x 60, "\n\n";
+
 print "Reading $base_file...\n";
 open my $fh, "<:raw", $base_file or die "Cannot open $base_file: $!\n";
 my $bios;
 read($fh, $bios, -s $base_file);
 close $fh;
-die "Expected 6MB BIOS" unless length($bios) == 6291456;
+die "Expected ${BIOS_SIZE}-byte BIOS" unless length($bios) == $BIOS_SIZE;
 
-# --- Step 2: Extract and decompress FV2 ---
-print "Extracting compressed FV2...\n";
-my $lzma_offset    = 0x1D6AC9;
+# ===================================================================
+# Step 2: Inject NVMe driver into Main FV
+# ===================================================================
+print "\nInjecting NVMe driver...\n";
+
+open $fh, "<:raw", $nvme_ffs_file or die "Cannot open $nvme_ffs_file: $!\n";
+my $nvme_ffs;
+read($fh, $nvme_ffs, -s $nvme_ffs_file);
+close $fh;
+die "NvmExpressDxe.ffs unexpected size" unless length($nvme_ffs) == $NVME_FFS_SIZE;
+
+# Verify target is free space
+for my $i (0 .. $NVME_FFS_SIZE - 1) {
+    die sprintf("Non-FF at 0x%06X", $NVME_FFS_OFF + $i)
+        unless ord(substr($bios, $NVME_FFS_OFF + $i, 1)) == 0xFF;
+}
+substr($bios, $NVME_FFS_OFF, $NVME_FFS_SIZE, $nvme_ffs);
+printf "  Inserted %d bytes at BIOS 0x%06X\n", $NVME_FFS_SIZE, $NVME_FFS_OFF;
+
+# ===================================================================
+# Step 3: Extract and decompress FV2
+# ===================================================================
+print "\nExtracting compressed FV2...\n";
+my $lzma_offset = 0x1D6AC9;
 my $orig_lzma_size = 1114349;
-my $orig_lzma      = substr($bios, $lzma_offset, $orig_lzma_size);
-
-# Save the original 13-byte LZMA header (props + dict + uncompressed size)
-# xz incorrectly writes 0xFFFFFFFFFFFFFFFF for the uncompressed size field,
-# but AMI's UEFI LZMA decoder requires the exact value to allocate its buffer.
+my $orig_lzma = substr($bios, $lzma_offset, $orig_lzma_size);
 my $orig_lzma_header = substr($orig_lzma, 0, 13);
 
 open my $tmp, ">:raw", "tmp_fv2.lzma" or die $!;
@@ -76,53 +84,56 @@ print $tmp $orig_lzma;
 close $tmp;
 
 system("xz --format=lzma -dk -f tmp_fv2.lzma") == 0
-    or die "LZMA decompression failed! Is xz installed?\n";
+    or die "LZMA decompression failed!\n";
 
 open $fh, "<:raw", "tmp_fv2" or die $!;
 my $fv2;
 read($fh, $fv2, -s "tmp_fv2");
 close $fh;
-printf "Decompressed FV2: %d bytes\n", length($fv2);
+printf "  Decompressed FV2: %d bytes\n", length($fv2);
 
-# --- Step 3: Patch DellErrorLogConfig driver ---
-print "Patching DellErrorLogConfig driver...\n";
-my $ffs_start = 0x008E7C;   # FFS file offset in decompressed FV2
-my $ffs_size  = 36365;      # FFS file size
-my $pe_start  = $ffs_start + 0x61;     # MZ header offset in FV2
-my $entry_off = $ffs_start + 0x0301;   # PE entry point in FV2 (RVA 0x2A0)
+# ===================================================================
+# Step 4: Patch DellErrorLogConfig driver
+# ===================================================================
+print "\nPatching DellErrorLogConfig driver...\n";
+my $ffs_start = 0x008E7C;
+my $ffs_size = 36365;
+my $entry_off = $ffs_start + 0x0301;  # PE entry point in fv2
 
-# Verify we're patching the right bytes
+# Verify original entry point: 48 89 5C (push rbx; mov [rsp+...])
 my @orig = map { ord(substr($fv2, $entry_off + $_, 1)) } 0..2;
-die sprintf("Entry point mismatch: expected 48 89 5C, got %02X %02X %02X\n" .
-    "Wrong BIOS version? This script is for Dell OptiPlex 9010 A30.",
+die sprintf("Entry point mismatch: expected 48 89 5C, got %02X %02X %02X",
     @orig) unless $orig[0] == 0x48 && $orig[1] == 0x89 && $orig[2] == 0x5C;
 
-# Patch entry point: xor eax, eax; ret  (return EFI_SUCCESS immediately)
+# Patch entry: xor eax, eax; ret (return EFI_SUCCESS)
 substr($fv2, $entry_off, 3, "\x33\xC0\xC3");
+printf "  Entry point: 48 89 5C -> 33 C0 C3 (xor eax,eax; ret)\n";
 
-# Zero dead .text section (after the ret) - unreachable code
-substr($fv2, $pe_start + 0x2A0 + 3, 0x3A0 - 3, "\x00" x (0x3A0 - 3));
+# Zero .text section (after ret) - dead code
+substr($fv2, $ffs_start + 0x2A0 + 3, 0x3A0 - 3, "\x00" x (0x3A0 - 3));
 
-# Zero dead .data section - 34KB of error strings that are never referenced
-substr($fv2, $pe_start + 0x680, 0x8680, "\x00" x 0x8680);
+# Zero .data section - dead string data (34KB of error strings)
+substr($fv2, $ffs_start + 0x680, 0x8680, "\x00" x 0x8680);
+print "  Zeroed dead .text and .data sections for better compression\n";
 
-# Fix inner FFS data checksum (DellErrorLogConfig FFS)
+# Fix inner FFS data checksum
 my $data_sum = 0;
 for my $i (24 .. $ffs_size - 1) {
     $data_sum = ($data_sum + ord(substr($fv2, $ffs_start + $i, 1))) & 0xFF;
 }
 my $new_ck = (256 - $data_sum) & 0xFF;
 substr($fv2, $ffs_start + 17, 1, chr($new_ck));
-printf "  Inner FFS checksum: 0x%02X\n", $new_ck;
+printf "  FFS data checksum: 0x%02X\n", $new_ck;
 
-# --- Step 4: Recompress FV2 ---
-print "Recompressing FV2...\n";
+# ===================================================================
+# Step 5: Recompress FV2
+# ===================================================================
+print "\nRecompressing FV2...\n";
 open $tmp, ">:raw", "tmp_fv2_patched" or die $!;
 print $tmp $fv2;
 close $tmp;
 
 unlink "tmp_fv2_patched.lzma";
-# Use matching LZMA parameters: lc=3, lp=0, pb=2, dict=8MB (props byte = 0x5D)
 system("xz --format=lzma --lzma1=dict=8MiB,lc=3,lp=0,pb=2 -k tmp_fv2_patched") == 0
     or die "LZMA compression failed!\n";
 
@@ -132,26 +143,25 @@ read($fh, $new_lzma, -s "tmp_fv2_patched.lzma");
 close $fh;
 
 my $new_lzma_size = length($new_lzma);
-printf "New LZMA: %d bytes (original: %d, saved: %d)\n",
+printf "  New LZMA: %d bytes (original: %d, saved: %d)\n",
     $new_lzma_size, $orig_lzma_size, $orig_lzma_size - $new_lzma_size;
-die "FATAL: Recompressed LZMA is larger than original!\n" .
-    "Try zeroing more dead data or using higher compression."
-    if $new_lzma_size > $orig_lzma_size;
+die "FATAL: Recompressed LZMA is larger than original!" if $new_lzma_size > $orig_lzma_size;
 
-# *** CRITICAL: Fix LZMA header ***
-# xz writes 0xFFFFFFFFFFFFFFFF for uncompressed size (stream mode).
-# AMI's UEFI decoder needs the exact uncompressed size to allocate its output buffer.
-# Restore the original 13-byte header (props + dict size + uncompressed size).
+# ===================================================================
+# Step 6: Fix LZMA header and replace in BIOS
+# ===================================================================
+print "\nFixing LZMA header and inserting...\n";
+
+# Restore original 13-byte header (xz writes wrong uncompressed size)
 substr($new_lzma, 0, 13, $orig_lzma_header);
 
-# --- Step 5: Replace LZMA in BIOS image ---
-print "Building $output_bios...\n";
+# Replace LZMA in BIOS
 substr($bios, $lzma_offset, $new_lzma_size, $new_lzma);
 my $pad = $orig_lzma_size - $new_lzma_size;
 substr($bios, $lzma_offset + $new_lzma_size, $pad, "\x00" x $pad) if $pad > 0;
 
-# Fix outer FFS data checksum (the FFS containing the compressed FV2)
-my $outer_ffs      = 0x1D6AA8;
+# Fix outer FFS data checksum
+my $outer_ffs = 0x1D6AA8;
 my $outer_ffs_size = 0x11010E;
 $data_sum = 0;
 for my $i (24 .. $outer_ffs_size - 1) {
@@ -161,55 +171,75 @@ $new_ck = (256 - $data_sum) & 0xFF;
 substr($bios, $outer_ffs + 17, 1, chr($new_ck));
 printf "  Outer FFS checksum: 0x%02X\n", $new_ck;
 
-# --- Step 6: Write outputs ---
-# Full 6MB BIOS
+# ===================================================================
+# Step 7: Verify
+# ===================================================================
+print "\nVerifying...\n";
+
+# NVMe FFS present
+my $nvme_hdr = substr($bios, $NVME_FFS_OFF, 4);
+printf "  NVMe FFS header: %s (present)\n", unpack("H8", $nvme_hdr);
+
+# SEC module intact
+my $sec = substr($bios, 0x5FEFE8, 4);
+printf "  SEC module intact: %s\n", ($sec ne ("\xFF" x 4)) ? "YES" : "NO";
+
+# FV_BB untouched
+open $fh, "<:raw", $base_file or die $!;
+my $backup;
+read($fh, $backup, $BIOS_SIZE);
+close $fh;
+printf "  FV_BB identical to stock: %s\n",
+    substr($bios, 0x500000, 0x100000) eq substr($backup, 0x500000, 0x100000) ? "YES" : "NO";
+
+# ===================================================================
+# Step 8: Write outputs
+# ===================================================================
+print "\nWriting output files...\n";
+
+# 6MB BIOS
 open my $out, ">:raw", $output_bios or die $!;
 print $out $bios;
 close $out;
-printf "Wrote %s (%d bytes)\n", $output_bios, length($bios);
+printf "  %s: %d bytes\n", $output_bios, length($bios);
 
-# 4MB chip image (BIOS[0x200000:0x5FFFFF])
-my $flash_4mb = substr($bios, 0x200000, 0x400000);
+# 4MB chip image
+my $spi1 = substr($bios, 0x200000, 0x400000);
 open $out, ">:raw", $output_4mb or die $!;
-print $out $flash_4mb;
+print $out $spi1;
 close $out;
-printf "Wrote %s (%d bytes)\n", $output_4mb, length($flash_4mb);
+printf "  %s: %d bytes\n", $output_4mb, length($spi1);
 
-# 8MB chip image (if dump provided)
-if ($spi2_dump) {
-    print "\nBuilding 8MB chip image from $spi2_dump...\n";
-    open $fh, "<:raw", $spi2_dump or die "Cannot open $spi2_dump: $!\n";
+# 8MB chip image (needs fresh dump)
+if (-f $spi2_dump_file) {
+    print "\n  Building 8MB image from $spi2_dump_file...\n";
+    open $fh, "<:raw", $spi2_dump_file or die $!;
     my $spi2;
-    read($fh, $spi2, -s $spi2_dump);
+    read($fh, $spi2, -s $spi2_dump_file);
     close $fh;
-    die "Expected 8MB chip dump" unless length($spi2) == 8388608;
+    die "8MB dump wrong size" unless length($spi2) == 8388608;
 
-    # Only replace the modified BIOS region (FFS header + LZMA portion)
-    # Preserves NVRAM, Intel ME, flash descriptor, and GbE config
-    my $bios_patch_start = 0x1D6AA8;  # outer FFS header
-    my $bios_patch_end   = 0x200000;  # chip boundary
-    my $patch_len = $bios_patch_end - $bios_patch_start;
-    my $chip_offset = 0x600000 + $bios_patch_start;
-
-    substr($spi2, $chip_offset, $patch_len,
-           substr($bios, $bios_patch_start, $patch_len));
-
+    substr($spi2, $SPI2_BIOS_OFF, 0x200000, substr($bios, 0, 0x200000));
     open $out, ">:raw", $output_8mb or die $!;
     print $out $spi2;
     close $out;
-    printf "Wrote %s (%d bytes)\n", $output_8mb, length($spi2);
-    print "  (NVRAM/ME/IFD preserved from original dump)\n";
+    printf "  %s: %d bytes\n", $output_8mb, length($spi2);
+
+    print "\n  WARNING: For best results, do a fresh 8MB chip read right before\n";
+    print "  flashing and rebuild with that dump to preserve current NVRAM.\n";
+} else {
+    print "\n  NOTE: $spi2_dump_file not found. 8MB image not built.\n";
+    print "  Read your 8MB chip fresh, save as $spi2_dump_file, and re-run.\n";
 }
 
-# --- Cleanup temp files ---
+# Cleanup
 unlink "tmp_fv2.lzma", "tmp_fv2", "tmp_fv2_patched", "tmp_fv2_patched.lzma";
 
-print "\n=== BUILD COMPLETE ===\n";
-print "Flash BOTH chips:\n";
-print "  8MB: flashrom -p ch341a_spi -c \"MX25L6406E/MX25L6408E\" -w $output_8mb\n"
-    if $spi2_dump;
+print "\n", "=" x 60, "\n";
+print "BUILD COMPLETE\n";
+print "=" x 60, "\n";
+print "\nBoth chips need flashing (F1 bypass modifies compressed FV2 which spans both).\n";
+print "Flash:\n";
 print "  4MB: flashrom -p ch341a_spi -c \"MX25L3206E/MX25L3208E\" -w $output_4mb\n";
-print "\nWARNING: You MUST flash both chips! The LZMA stream spans the chip boundary.\n"
-    if $spi2_dump;
-print "\nNOTE: 8MB chip image not generated (no dump provided).\n" .
-      "  Run: perl $0 <8mb_chip_dump.bin>\n" unless $spi2_dump;
+print "  8MB: flashrom -p ch341a_spi -c \"MX25L6406E/MX25L6408E\" -w $output_8mb\n";
+print "\nRecovery: flash original chip backups to restore stock.\n";

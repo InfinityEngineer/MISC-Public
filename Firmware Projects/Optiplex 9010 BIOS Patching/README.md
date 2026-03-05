@@ -46,23 +46,51 @@ BIOS[0x200000-0x5FFFFF] -> 4MB chip at offset 0x000000
 
 ---
 
-## Mods
+## Mods (Pick Your Tier)
 
-### 1. F1 Fan Failure Bypass (`build_f1_bypass.pl`)
+Each tier builds on the previous. Pick whichever level suits your needs:
+
+| Tier | Script | What It Does | Chips to Flash |
+|------|--------|-------------|----------------|
+| 1 | `build_nvme_only.pl` | NVMe boot support | 4MB only |
+| 2 | `build_f1_bypass.pl` | NVMe + F1 fan error bypass | Both (4MB + 8MB) |
+| 3 | `build_rebar.pl` | NVMe + F1 bypass + ReBAR + Above 4G | Both (4MB + 8MB) |
+
+### Tier 1: NVMe Boot (`build_nvme_only.pl`)
+
+**Problem:** The stock 9010 BIOS has no NVMe driver, so NVMe SSDs in PCIe adapters aren't bootable.
+
+**Solution:** Injects `NvmExpressDxe.ffs` into Main FV free space at BIOS offset `0x3564B0`.
+
+**Simple mod** — only the 4MB chip needs flashing, no LZMA recompression needed.
+
+```bash
+perl build_nvme_only.pl
+flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_nvmeonly_write.bin
+```
+
+### Tier 2: F1 Fan Failure Bypass (`build_f1_bypass.pl`)
 
 **Problem:** Non-stock fans (or missing Dell fan headers) trigger "Alert! Previous fan failure" at every POST, requiring you to press F1 to continue. This blocks unattended reboots (Windows Updates hang at the F1 prompt).
 
-**Solution:** Patches the `DellErrorLogConfig` DXE driver (GUID `038CE287-B806-45B6-A819-514DAF4B91B9`) to return `EFI_SUCCESS` immediately, preventing the error display routine from ever executing.
+**Solution:** Patches the `DellErrorLogConfig` DXE driver (GUID `038CE287-B806-45B6-A819-514DAF4B91B9`) to return `EFI_SUCCESS` immediately, preventing the error display routine from ever executing. Also includes NVMe driver injection.
 
 **How it works:**
-1. Extracts the LZMA-compressed firmware volume (FV2) containing 183 DXE drivers
-2. Locates the DellErrorLogConfig FFS file at FV2 offset `0x008E7C`
-3. Patches the PE entry point: `48 89 5C` -> `33 C0 C3` (xor eax, eax; ret)
-4. Zeros dead `.text` and `.data` sections (34KB of error strings) to improve compression
-5. Recompresses with LZMA, fixes the header (xz bug workaround), updates FFS checksums
-6. Generates write images for both flash chips
+1. Injects NVMe driver into Main FV free space
+2. Extracts the LZMA-compressed firmware volume (FV2) containing 183 DXE drivers
+3. Locates the DellErrorLogConfig FFS file at FV2 offset `0x008E7C`
+4. Patches the PE entry point: `48 89 5C` -> `33 C0 C3` (xor eax, eax; ret)
+5. Zeros dead `.text` and `.data` sections (34KB of error strings) to improve compression
+6. Recompresses with LZMA, fixes the header (xz bug workaround), updates FFS checksums
+7. Generates write images for both flash chips
 
-### 2. Resizable BAR (`build_rebar.pl`)
+```bash
+perl build_f1_bypass.pl
+flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_f1bypass_write.bin
+flashrom -p ch341a_spi -c "MX25L6406E/MX25L6408E" -w spi2_f1bypass_write.bin
+```
+
+### Tier 3: Resizable BAR (`build_rebar.pl`)
 
 **Problem:** The Dell 9010 BIOS doesn't support Resizable BAR or Above 4G Decoding. Modern GPUs (RTX 3000/4000 series) benefit from ReBAR for 5-15% better performance in some games.
 
@@ -227,30 +255,47 @@ Or to go fully stock, use the original backups.
 
 ### Prerequisites
 
-- Perl 5
-- `xz` command-line tool (for LZMA compression, included with Git for Windows)
-- `F1_BYPASS_V4.BIN` as the base image (NVMe + F1 bypass already applied)
-- `ReBarDxe.ffs` (from xCuri0/ReBarUEFI v0.3 release)
-- A fresh dump of your 8MB chip (to preserve NVRAM settings)
+- **Perl 5** (included with Git for Windows, or install Strawberry Perl)
+- **`xz`** command-line tool (for LZMA compression, included with Git for Windows)
+- **CH341A USB SPI programmer** with 3.3V mod + SOIC-8 test clip
+- **flashrom** (Windows build)
+- **`BACKUP.BIN`** — your own stock BIOS dump (included in this repo as reference)
 
-### Build
+All other dependencies (`NvmExpressDxe.ffs`, `ReBarDxe.ffs`, `ReBarState.exe`) are included in this repo.
+
+### Build Chain
+
+The scripts form a dependency chain. Each tier includes everything from the previous tier:
+
+```
+BACKUP.BIN ──→ build_nvme_only.pl ──→ NVME_ONLY.BIN  (Tier 1)
+BACKUP.BIN ──→ build_f1_bypass.pl ──→ F1_BYPASS.BIN   (Tier 2, self-contained)
+F1_BYPASS.BIN ─→ build_rebar.pl ───→ REBAR.BIN        (Tier 3, needs Tier 2 output)
+```
+
+**For Tier 3 (ReBAR), build Tier 2 first:**
 
 ```bash
-# Read your 8MB chip first (preserves NVRAM/boot settings)
+# Step 1: Dump your 8MB chip (preserves NVRAM)
 flashrom -p ch341a_spi -c "MX25L6406E/MX25L6408E" -r spi2_preflight_read1.bin
 
-# Build
+# Step 2: Build F1 bypass (includes NVMe)
+perl build_f1_bypass.pl
+
+# Step 3: Build ReBAR (includes everything)
 perl build_rebar.pl
 
-# Flash both chips
+# Step 4: Flash both chips
 flashrom -p ch341a_spi -c "MX25L6406E/MX25L6408E" -w spi2_rebar_write.bin
 flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_rebar_write.bin
 ```
 
-### Post-Flash
+### Post-Flash (Tier 3 / ReBAR only)
 
 1. CMOS reset (IFR patches make 4G Decoding and CSM settings default correctly)
 2. Boot modGRUBShell from USB (F12 → UEFI: USB)
+   - Get modGRUBShell.efi from [datasone/grub-mod-setup_var](https://github.com/datasone/grub-mod-setup_var/releases)
+   - Place as `EFI/Boot/bootx64.efi` on a FAT32 USB drive
 3. Run setup_var commands (needed even with IFR patches if NVRAM existed before):
    ```
    setup_var 0x2F 0x02     # Video OpROM = UEFI only
@@ -263,6 +308,18 @@ flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_rebar_write.bin
 4. Reboot → Boot to Windows
 5. Run `ReBarState.exe`, set BAR size to `32` (unlimited)
 6. Reboot, verify with GPU-Z → Advanced tab → Resizable BAR
+
+### Repo Contents
+
+| File | Size | Description |
+|------|------|-------------|
+| `BACKUP.BIN` | 6MB | Stock Dell OptiPlex 9010 A30 BIOS dump |
+| `NvmExpressDxe.ffs` | 6KB | NVMe DXE driver (FFS format, ready to inject) |
+| `ReBarDxe.ffs` | 2.5KB | ReBAR DXE driver from [xCuri0/ReBarUEFI v0.3](https://github.com/xCuri0/ReBarUEFI/releases) |
+| `ReBarState.exe` | 20KB | Windows utility to set ReBAR size in NVRAM |
+| `build_nvme_only.pl` | — | Tier 1: NVMe boot only |
+| `build_f1_bypass.pl` | — | Tier 2: NVMe + F1 fan error bypass |
+| `build_rebar.pl` | — | Tier 3: Full ReBAR (all patches) |
 
 ---
 
