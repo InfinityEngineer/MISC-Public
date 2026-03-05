@@ -4,15 +4,28 @@ Patches for the Dell OptiPlex 9010 MT (Mini Tower) BIOS, version A30.
 
 These were developed with Claude Code (Anthropic's CLI agent) doing binary analysis, reverse engineering, and build scripting. No GUI tools required - everything is done with Perl scripts and command-line utilities.
 
+## Current Status
+
+| Feature | Status |
+|---------|--------|
+| NVMe Boot | Working |
+| F1 Fan Failure Bypass | Working |
+| Above 4G Decoding | **Working** (survives warm reboots!) |
+| Resizable BAR (ReBAR) | **Pending** — need to run `ReBarState.exe` |
+
+The RTX 4060 8GB is confirmed by GPU-Z to have hardware ReBAR support and Above 4G Decoding enabled in BIOS. Only the final `ReBarState.exe` step remains.
+
 ## Hardware Setup
 
 - **Dell OptiPlex 9010 MT** (Ivy Bridge / Q77 chipset)
+- **NVIDIA RTX 4060 8GB** (native ReBAR support)
+- **32GB DDR3 RAM** (4x8GB)
 - **CH341A USB SPI programmer** (3.3V mod required!)
 - **SOIC-8 test clip** for in-circuit flashing
 
 ### Flash Chip Layout
 
-The 9010 has **two SPI flash chips**:
+The 9010 has **two SPI flash chips** (combined 12MB):
 
 | Chip | Part Number | Size | Contents |
 |------|-------------|------|----------|
@@ -25,15 +38,17 @@ BIOS[0x000000-0x1FFFFF] -> 8MB chip at offset 0x600000
 BIOS[0x200000-0x5FFFFF] -> 4MB chip at offset 0x000000
 ```
 
-**This matters!** Some modifications (like the F1 bypass) involve compressed data that crosses the chip boundary. You must flash both chips or you'll get a corrupted LZMA stream and a bricked machine.
+**This matters!** Some modifications involve compressed data that crosses the chip boundary. You must flash both chips or you'll get a corrupted LZMA stream and a bricked machine.
 
 ## Stock BIOS
 
 `BACKUP.BIN` - Unmodified Dell OptiPlex 9010 A30 BIOS dump (6MB). This is the complete BIOS region extracted from both flash chips.
 
+---
+
 ## Mods
 
-### F1 Fan Failure Bypass (`build_f1_bypass.pl`)
+### 1. F1 Fan Failure Bypass (`build_f1_bypass.pl`)
 
 **Problem:** Non-stock fans (or missing Dell fan headers) trigger "Alert! Previous fan failure" at every POST, requiring you to press F1 to continue. This blocks unattended reboots (Windows Updates hang at the F1 prompt).
 
@@ -47,59 +62,258 @@ BIOS[0x200000-0x5FFFFF] -> 4MB chip at offset 0x000000
 5. Recompresses with LZMA, fixes the header (xz bug workaround), updates FFS checksums
 6. Generates write images for both flash chips
 
-**Prerequisites:**
-- Perl 5
-- `xz` command-line tool (for LZMA compression)
-- `NVME_ONLY.BIN` or stock `BACKUP.BIN` as the base image
-- A fresh dump of your 8MB chip (to preserve your NVRAM settings)
+### 2. Resizable BAR (`build_rebar.pl`)
 
-**Usage:**
+**Problem:** The Dell 9010 BIOS doesn't support Resizable BAR or Above 4G Decoding. Modern GPUs (RTX 3000/4000 series) benefit from ReBAR for 5-15% better performance in some games.
+
+**Solution:** Applies 8 hex patches + 3 DSDT patches + 1 IFR patch + 1 WarmBootPei patch, plus injects the ReBarDxe.ffs driver. This was the result of weeks of reverse engineering to solve a warm reboot black screen issue unique to the 9010 platform.
+
+#### All Patches Applied
+
+**FV1 (compressed, LZMA at BIOS 0x050069, on 8MB chip):**
+
+| # | Module | Description | FV1 Offset |
+|---|--------|-------------|------------|
+| 1 | PciHostBridge | Remove <4GB BAR size limit | 0x107F6C |
+| 2 | PciHostBridge | Fix AddMemorySpace (MMIO ceiling 16GB→64GB) | 0x107645 |
+| 3 | PciHostBridge | Remove 4GB PciRootBridgeIo.Mem limit (v1) | 0x108822 |
+| 4 | PciHostBridge | Remove 4GB PciRootBridgeIo.Mem limit (v2) | 0x1088CA |
+| 5 | PciBus | Remove <16GB BAR limit | 0x0557D0 |
+| 6a | Runtime | Remove 4GB CpuIo2 limit (instance 1) | 0x03CAAF |
+| 6b | Runtime | Remove 4GB CpuIo2 limit (instance 2) | 0x03CB8B |
+| 7 | PciBus | IvyUSB3 XHCI 64-bit blacklist fix | 0x05A415 |
+
+**DSDT Patches (in AmiBoardInfo, DSDT at FV1 0x05B9E1):**
+
+| Patch | DSDT Offset | Description |
+|-------|-------------|-------------|
+| C | +0x1973 | `ElseIf(E4GM)` → `ElseIf(OSYS)` — bypass dead E4GM gate |
+| A | +0x199B | `Store(16GB, M2LN)` → `Store(0xFFFFFFFFF, M2MX)` — expand to 64GB ceiling |
+| B | +0x19CF | `M2MX=(M2MN+M2LN)-1` → `M2LN=(M2MX-M2MN)+1` — reverse calculation |
+
+**IFR Default (in Setup FFS at FV1 0x3F2E54):**
+- CheckBox at FV1 0x45ACCA, Flags byte at 0x45ACD6: `0x00` → `0x01`
+- Makes "Above 4G Decoding" default to Enabled after CMOS reset
+
+**FV_BB (uncompressed, on 4MB chip):**
+- WarmBootPei at BIOS 0x570A00: `75 12` (JNE) → `EB 12` (JMP) at 0x570CBB
+- Disables warm boot marker detection → forces full PCI enumeration every boot
+
+**Main FV (uncompressed, on 4MB chip):**
+- NVMe driver injected at BIOS 0x3564B0 (6024 bytes)
+- ReBarDxe.ffs injected at BIOS 0x357C38 (2578 bytes)
+
+---
+
+## Root Cause Analysis: Warm Reboot Black Screen
+
+This was the hardest problem to solve. Enabling Above 4G Decoding would work on the first cold boot, but warm reboots would produce a black screen with no display output.
+
+### The Root Cause Chain
+
+1. **E4GM gate (DSDT)**: Dell never wired up the `E4GM` (Enable 4G Memory) variable on the 9010. The DSDT has a conditional branch `ElseIf(E4GM)` that declares 64-bit PCI memory resources, but since E4GM is always zero, this branch was dead code. **Fix: Patch C** — change `E4GM` to `OSYS` (OS version year), which is always non-zero on modern Windows.
+
+2. **WarmBootPei (PEI module)**: A 912-byte PEI module checks for a `_WB_` (Warm Boot) marker in BIOS data area memory (address 0x40E). When found, it calls a PPI to signal warm boot, which triggers `BOOT_ASSUMING_NO_CONFIGURATION_CHANGES` mode. **Fix:** JNE→JMP at BIOS 0x570CBB — the warm boot handler never triggers.
+
+3. **PciHostBridge DXE**: In `BOOT_ASSUMING_NO_CONFIGURATION_CHANGES` mode, PciHostBridge skips full 64-bit MMIO allocation. The GPU's above-4G BAR isn't allocated, display initialization fails, black screen.
+
+### What We Tried (and Ruled Out)
+
+| Attempt | Result | Why It Failed |
+|---------|--------|---------------|
+| SaInitPeim transplant (7010→9010) | Hard PEI hang | Incompatible despite same hardware |
+| SaInitPeim JE→JMP patch | Made first boot worse | Skipped needed config write |
+| SaInitPeim JE→NOP NOP patch | No effect on reboots | Not the root cause |
+| Option B (MM64 removal, 4G OFF) | Won't work | Consumer GPUs need 4G Decoding on LGA1155 |
+| PchS3Peim | Red herring | Was never modified by 7010 guide |
+
+The breakthrough was finding WarmBootPei — a tiny module that most BIOS modders never look at.
+
+---
+
+## CMOS Reset Procedure (Dell 9010)
+
+**Dell requires STANDBY POWER during reset!** This is different from most motherboards.
+
+The 4 pins are TWO separate 2-pin headers in a 2x2 layout:
+- **PSWD** (password) — default: jumper installed on pins 1-2
+- **RTCRST** (RTC reset) — default: open (no jumper)
+
+### Steps
+
+1. Shut down, **unplug** power cord completely
+2. Hold power button 15-20 seconds (drain capacitors)
+3. Move jumper from PSWD to RTCRST
+4. **Plug power cord BACK IN** (don't press power button)
+5. Wait **10 seconds** — 5V standby rail signals CMOS to clear
+6. **Unplug** cord again
+7. Press power button once to drain residual
+8. Move jumper back to PSWD position
+9. Plug in, power on
+
+**Notes:**
+- Battery removal alone does NOT reliably clear NVRAM on 9010 (PCH has internal RTC)
+- RTCRST clears ALL setup_var values, boot order, passwords — everything in CMOS/NVRAM
+- RTCRST does NOT affect SPI flash contents (your mods are preserved)
+- With the IFR patch, CMOS reset now defaults to 4G Decoding ON
+
+---
+
+## Recovery Checklist
+
+Work through these in order. Stop when it boots.
+
+### Level 1: Reseat Everything (most likely after physical contact)
+
+- Power off, unplug power cord completely
+- Reseat ALL 4 RAM sticks — pull each one fully out, reseat firmly until both clips click
+- Reseat the GPU — pull it out, reseat firmly, make sure the PCIe latch clicks
+- Check all power cables — 24-pin motherboard, 8-pin CPU, GPU power (if any)
+- Check video cable connection (both ends)
+- Plug power cord back in, power on
+
+### Level 2: Minimal Boot Config
+
+- Power off, unplug
+- Remove GPU entirely
+- Use ONLY 1 RAM stick in slot closest to CPU (DIMM1 / blue slot)
+- Connect monitor to motherboard video output (VGA/DisplayPort on rear I/O)
+- CMOS reset (see procedure above)
+- Plug in, power on
+- If this boots: power off, add RAM sticks one at a time, testing each
+- Once all RAM works: add GPU back, move video cable to GPU
+
+### Level 3: Extended Power Drain
+
+- Power off, unplug power cord
+- CMOS reset jumper to clear position
+- Hold the front power button for 30 seconds
+- Wait 5 full minutes with jumper in clear position
+- Move jumper back to normal position
+- Plug in, power on
+
+### Level 4: Reflash (nuclear option)
+
+If nothing above works and you suspect BIOS/NVRAM corruption:
+
 ```bash
-# Read your 8MB chip first (preserves your NVRAM/boot settings)
-flashrom -p ch341a_spi -c "MX25L6406E/MX25L6408E" -r my_8mb_dump.bin
+cd C:\Users\clayi\Desktop\9010_BIOS_BACKUP\flashrom\flashrom-1.4
+
+# 4MB chip (closest to you)
+flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_rebar_write.bin
+
+# 8MB chip
+flashrom -p ch341a_spi -c "MX25L6406E/MX25L6408E" -w spi2_rebar_write.bin
+```
+
+Or to go fully stock, use the original backups.
+
+### Diagnostic Beeps / LEDs
+
+- Listen for beep codes on power-on (no RAM = continuous beeps, bad RAM = 3 beeps)
+- Solid amber power LED = hardware fault; solid/blinking green = normal POST
+- Fans spin but no display = POST-related, not dead hardware
+
+---
+
+## Building from Source
+
+### Prerequisites
+
+- Perl 5
+- `xz` command-line tool (for LZMA compression, included with Git for Windows)
+- `F1_BYPASS_V4.BIN` as the base image (NVMe + F1 bypass already applied)
+- `ReBarDxe.ffs` (from xCuri0/ReBarUEFI v0.3 release)
+- A fresh dump of your 8MB chip (to preserve NVRAM settings)
+
+### Build
+
+```bash
+# Read your 8MB chip first (preserves NVRAM/boot settings)
+flashrom -p ch341a_spi -c "MX25L6406E/MX25L6408E" -r spi2_preflight_read1.bin
 
 # Build
-perl build_f1_bypass.pl my_8mb_dump.bin
+perl build_rebar.pl
 
 # Flash both chips
-flashrom -p ch341a_spi -c "MX25L6406E/MX25L6408E" -w spi2_f1bypass_write.bin
-flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_f1bypass_write.bin
+flashrom -p ch341a_spi -c "MX25L6406E/MX25L6408E" -w spi2_rebar_write.bin
+flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_rebar_write.bin
 ```
+
+### Post-Flash
+
+1. CMOS reset (IFR patch makes 4G Decoding default to ON)
+2. Boot to Windows
+3. Run `ReBarState.exe`, set BAR size to `32` (unlimited)
+4. Reboot, verify with GPU-Z → Advanced tab → Resizable BAR
+
+---
+
+## FV1 Key Modules
+
+| Module | GUID | FV1 Offset | Size |
+|--------|------|------------|------|
+| PciBus | 3C1DE39F-D207-408A-AACC-731CFB7F1DD7 | 0x04DA24 | 54,681 |
+| PciHostBridge | 8D6756B9-E55E-4D6A-A3A5-5E4D72DDF772 | 0x106FAC | 11,309 |
+| Runtime | CBC59C4A-383A-41EB-A8EE-4498AEA567E4 | 0x033B6C | 89,825 |
+| AmiBoardInfo | 9F3A0016-AE55-4288-829D-D22FD344C347 | 0x05AFC4 | 46,361 |
+| Setup | 899407D7-99FE-43D8-9A21-79EC328CAC21 | 0x3F2E54 | 426,485 |
+
+## FV_BB Key PEI Modules
+
+| Module | GUID | BIOS Offset | Size |
+|--------|------|-------------|------|
+| MemoryInit | 3B42EF57-... | 0x500048 | 160,358 |
+| SBPEI | C1FBD624-... | 0x5443F0 | 18,904 |
+| SaInitPeim | FD236AE7-...A811 | 0x553A10 | 18,818 (stock, unmodified) |
+| WarmBootPei | B178E5AA-0876-420A-B40F-E39B4E6EE05B | 0x570A00 | 912 (JNE→JMP patch) |
+
+---
 
 ## Gotchas & Lessons Learned
 
 1. **The LZMA stream spans both chips.** The compressed FV2 starts at BIOS offset `0x1D6AC9` (8MB chip) and ends at `0x2E6BB6` (4MB chip). Flashing only one chip = corrupted LZMA = bricked display output.
 
-2. **xz writes the wrong LZMA header.** When recompressing with `xz --format=lzma`, it writes `0xFFFFFFFFFFFFFFFF` for the uncompressed size (stream mode). AMI's UEFI LZMA decoder needs the exact uncompressed size to allocate its output buffer. The build script fixes this by restoring the original 13-byte LZMA header after recompression.
+2. **xz writes the wrong LZMA header.** When recompressing with `xz --format=lzma`, it writes `0xFFFFFFFFFFFFFFFF` for the uncompressed size (stream mode). AMI's UEFI LZMA decoder needs the exact uncompressed size. The build script restores the original 13-byte LZMA header after recompression.
 
-3. **Use a fresh 8MB chip dump as the base.** The 8MB chip contains NVRAM (boot order, AHCI/RAID mode, etc.). If you use an old dump, you'll overwrite your current settings and may get "no boot device found" on first boot.
+3. **Use a fresh 8MB chip dump as the base.** The 8MB chip contains NVRAM (boot order, AHCI/RAID mode, etc.). If you use an old dump, you'll overwrite your current settings.
 
-4. **FFS checksums must be updated.** Both the inner FFS (DellErrorLogConfig) and outer FFS (the compressed FV2 container) have data checksums that must be recalculated after modification.
+4. **FFS checksums must be updated.** Any FFS with attrs bit 0x40 has a data checksum at header byte 17 that must be recalculated after modification.
 
 5. **CH341A voltage mod is essential.** The stock CH341A outputs 5V on its data lines but these flash chips are 3.3V. You must do the 3.3V mod or use a level shifter.
 
 6. **Always read twice before writing.** If two consecutive reads don't match byte-for-byte, your clip connection is bad.
 
-## Recovery
+7. **Dell CMOS reset requires standby power** (plugged in but off) during RTCRST.
 
-If anything goes wrong, flash your original chip dumps back:
-```bash
-# 8MB chip
-flashrom -p ch341a_spi -c "MX25L6406E/MX25L6408E" -w your_8mb_backup.bin
-# 4MB chip
-flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w your_4mb_backup.bin
-```
+8. **E4GM is always zero on Dell 9010** — DSDT patches inside `ElseIf(E4GM)` are dead code without the E4GM→OSYS fix.
 
-As long as you have your original chip dumps and a working CH341A, the machine is always recoverable.
+9. **WarmBootPei is the root cause of warm reboot black screen** — disabling its `_WB_` check forces full PCI enumeration on every boot.
 
-## Tools
+10. **IFR default changes only take effect after NVRAM wipe** — existing NVRAM values take precedence.
+
+11. **7010 and 9010 share the SAME physical motherboard** (confirmed by Libreboot/Dasharo). Stock DXE modules are byte-for-byte identical.
+
+12. **SaInitPeim transplant from 7010 causes hard PEI hang** despite identical hardware. SaInitPeim surgical patches (both directions) don't fix reboots — not the root cause.
+
+13. **Dell BIOS .exe files use PFS format** — extract with biosutilities DellPfsExtract.
+
+14. **UEFITool can silently displace fixed-location modules** — always inject into FREE SPACE.
+
+---
+
+## Tools & References
 
 - [flashrom](https://flashrom.org/) - Open-source flash programmer
 - [Zadig](https://zadig.akeo.ie/) - USB driver installer (needed for CH341A on Windows)
-- `xz` - LZMA compression (included with Git for Windows, or install via package manager)
+- [xCuri0/ReBarUEFI](https://github.com/xCuri0/ReBarUEFI) - ReBAR DXE driver + ReBarState utility
+- [Dell 7010 ReBAR guide](https://github.com/jrdoughty/Dell-7010-rebar-guide) - Reference (same Q77 chipset)
+- [DSDT Patching wiki](https://github.com/xCuri0/ReBarUEFI/wiki/DSDT-Patching) - xCuri0's DSDT docs
+- [Common issues](https://github.com/xCuri0/ReBarUEFI/wiki/Common-issues-(and-fixes)) - ReBarUEFI troubleshooting
 
 ## Credits
 
 - Reverse engineering and build automation: [Claude Code](https://claude.com/claude-code) (Anthropic)
 - DellErrorLogConfig driver identification: Win-Raid community research on Dell 7020
 - NVMe mod technique: [Tachytelic guide](https://tachytelic.net/2021/12/dell-optiplex-7010-pcie-nvme/)
+- ReBAR tooling: [xCuri0/ReBarUEFI](https://github.com/xCuri0/ReBarUEFI)
