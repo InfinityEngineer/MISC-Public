@@ -25,8 +25,7 @@
 #
 # === POST-FLASH STEPS ===
 # 1. CMOS reset (IFR defaults: 4G=ON, CSM=Never, OpROMs=UEFI only)
-# 2. Boot modGRUBShell, run: setup_var 0x2 0x1 (enable 4G in NVRAM)
-#    Also run CSM setup_vars if needed (see NEXT_STEPS.md for full list)
+# 2. Boot modGRUBShell, run all 6 setup_var commands (see README.md)
 # 3. Boot Windows, run ReBarState.exe, set BAR size to 32
 # 4. Reboot, verify with GPU-Z
 #

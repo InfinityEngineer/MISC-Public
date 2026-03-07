@@ -4,16 +4,16 @@ Patches for the Dell OptiPlex 9010 MT (Mini Tower) BIOS, version A30.
 
 These were developed with Claude Code (Anthropic's CLI agent) doing binary analysis, reverse engineering, and build scripting. No GUI tools required - everything is done with Perl scripts and command-line utilities.
 
-## Current Status
+## Status: Complete
 
 | Feature | Status |
 |---------|--------|
 | NVMe Boot | Working |
 | F1 Fan Failure Bypass | Working |
-| Above 4G Decoding | **Working** (survives warm reboots!) |
-| Resizable BAR (ReBAR) | **Working** (GPU-Z confirmed!) |
+| Above 4G Decoding | Working |
+| Resizable BAR (ReBAR) | Working (8GB BAR confirmed) |
 
-All features confirmed working with RTX 4060 8GB. ReBAR enabled via `ReBarState.exe` with BAR size 32 (unlimited).
+All features confirmed working with RTX 4060 8GB. ReBAR verified via `nvidia-smi` (BAR1 = 8192 MiB) and `ReBarState.exe` with BAR size 32 (unlimited). Stable across warm reboots and power cycles.
 
 ## Hardware Setup
 
@@ -293,21 +293,29 @@ flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_rebar_write.bin
 ### Post-Flash (Tier 3 / ReBAR only)
 
 1. CMOS reset (IFR patches make 4G Decoding and CSM settings default correctly)
-2. Boot modGRUBShell from USB (F12 → UEFI: USB)
+2. Boot modGRUBShell from USB:
    - Get modGRUBShell.efi from [datasone/grub-mod-setup_var](https://github.com/datasone/grub-mod-setup_var/releases)
    - Place as `EFI/Boot/bootx64.efi` on a FAT32 USB drive
+   - **Option A:** Cold boot (full power cycle) + spam F12 → select USB
+   - **Option B (no F12 needed):** From Windows, run:
+     ```
+     bcdedit /enum firmware    # find the USB drive's GUID
+     bcdedit /set {fwbootmgr} bootsequence {guid-here}
+     shutdown /s /t 0          # full shutdown (NOT restart)
+     ```
+     Then press the power button — it boots straight to USB.
 3. Run setup_var commands (needed even with IFR patches if NVRAM existed before):
    ```
-   setup_var 0x2F 0x02     # Video OpROM = UEFI only
-   setup_var 0x2E 0x02     # Storage OpROM = UEFI only
-   setup_var 0x2D 0x02     # PXE OpROM = UEFI only
-   setup_var 0xBDF 0x02    # Boot option filter = UEFI only
-   setup_var 0xBDE 0x02    # Launch CSM = Never
    setup_var 0x2 0x1       # Above 4G Decoding = Enabled
+   setup_var 0xBDE 0x02    # Launch CSM = Never
+   setup_var 0xBDF 0x02    # Boot option filter = UEFI only
+   setup_var 0x2D 0x02     # PXE OpROM = UEFI only
+   setup_var 0x2E 0x02     # Storage OpROM = UEFI only
+   setup_var 0x2F 0x02     # Video OpROM = UEFI only
    ```
-4. Reboot → Boot to Windows
+4. Type `reboot` → Boot to Windows
 5. Run `ReBarState.exe`, set BAR size to `32` (unlimited)
-6. Reboot, verify with GPU-Z → Advanced tab → Resizable BAR
+6. Reboot, verify with GPU-Z (Advanced tab → Resizable BAR) or `nvidia-smi -q` (BAR1 = 8192 MiB)
 
 ### Repo Contents
 
@@ -356,7 +364,7 @@ flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_rebar_write.bin
 
 5. **CH341A voltage mod is essential.** The stock CH341A outputs 5V on its data lines but these flash chips are 3.3V. You must do the 3.3V mod or use a level shifter.
 
-6. **Always read twice before writing.** If two consecutive reads don't match byte-for-byte, your clip connection is bad.
+6. **Always read twice before writing.** If two consecutive reads don't match byte-for-byte, your clip connection is bad. Plug the CH341A directly into the computer — USB hubs cause disconnections.
 
 7. **Dell CMOS reset requires standby power** (plugged in but off) during RTCRST.
 
@@ -366,9 +374,9 @@ flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_rebar_write.bin
 
 10. **IFR default changes only take effect after NVRAM wipe** — existing NVRAM values take precedence.
 
-11. **7010 and 9010 share the SAME physical motherboard** (confirmed by Libreboot/Dasharo). Stock DXE modules are byte-for-byte identical.
+11. **7010 and 9010 share the SAME physical motherboard** (confirmed by Libreboot/Dasharo). Stock DXE modules are byte-for-byte identical. Patched modules from the 7010 guide work on the 9010 without modification.
 
-12. **SaInitPeim transplant from 7010 causes hard PEI hang** despite identical hardware. SaInitPeim surgical patches (both directions) don't fix reboots — not the root cause.
+12. **SaInitPeim transplant from 7010 causes hard PEI hang** despite identical hardware. Not the root cause — avoid this.
 
 13. **Dell BIOS .exe files use PFS format** — extract with biosutilities DellPfsExtract.
 
@@ -379,6 +387,12 @@ flashrom -p ch341a_spi -c "MX25L3206E/MX25L3208E" -w spi1_rebar_write.bin
 16. **CSM ON + Above 4G Decoding ON = black screen** (POST level failure) — Legacy Video OpROM conflicts with 64-bit MMIO.
 
 17. **All CSM settings are in VarStore 2**, accessible via `setup_var` at offsets 0x2D-0x2F (OpROM policies), 0xBDE (Launch CSM), 0xBDF (Boot option filter).
+
+18. **"Enable Legacy Option ROMs = Disabled" via IFR defaults BRICKS the system** — no POST, no display, no HDD activity. Dell firmware apparently needs this enabled even in UEFI-only mode for GPU option ROM to load. Do NOT bake this into IFR defaults.
+
+19. **The "Setup" UEFI variable is Boot Services only (NV+BS, no Runtime).** You cannot read or modify it from Windows using `GetFirmwareEnvironmentVariable`. The `setup_var` command only works from the UEFI pre-boot environment (modGRUBShell). However, you can use `bcdedit /set {fwbootmgr} bootsequence` from Windows to boot the USB drive without needing F12.
+
+20. **Follow the 4-step flash procedure**: detect chip → read backup → write+verify → read again. Never skip the pre-write backup or post-write verification read.
 
 ---
 
