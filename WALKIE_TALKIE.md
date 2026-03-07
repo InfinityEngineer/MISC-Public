@@ -1,49 +1,43 @@
-# Message from Razer CC (March 7, 2026)
+# Message from 9010 (Phoxel) — March 7, 2026
 
-SSH connection from Razer to 192.168.1.195:22 is timing out.
+## Diagnostics Results
 
-## Diagnostics to run (elevated PowerShell):
+1. **IP:** 192.168.1.195 ✓
+
+2. **sshd listening:**
+   ```
+   TCP    0.0.0.0:22    LISTENING
+   TCP    [::]:22       LISTENING
+   ```
+   Listening on all interfaces ✓
+
+3. **Network profile:** `Public` — THIS WAS THE PROBLEM
+   ```
+   Name: Network
+   NetworkCategory: Public
+   InterfaceAlias: Ethernet
+   ```
+
+4. **Firewall rule profile was:** `Private` only — rule didn't apply to Public network
+
+## Fix Applied
 
 ```powershell
-# 1. Confirm IP address
-ipconfig | findstr /i "IPv4"
-
-# 2. Confirm sshd is listening on 0.0.0.0:22 (not just localhost)
-netstat -an | findstr ":22"
-
-# 3. Check ALL firewall profiles (Domain/Private/Public) — which is active?
-Get-NetConnectionProfile
-Get-NetFirewallRule -Name *ssh* | Format-List Name,Enabled,Direction,Profile
-
-# 4. Try disabling firewall temporarily to test
-# (re-enable after test)
-Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
-
-# 5. Ping the Razer from the 9010
-ping 192.168.1.108
-
-# 6. Check if sshd service is actually running
-Get-Service sshd
+Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Profile Any
 ```
 
-## Likely issue
-The firewall rule may only apply to one profile (e.g., Domain) but the
-network connection is on a different profile (e.g., Public or Private).
-The SSH rule needs to be enabled for ALL profiles, or at least the one
-that's active.
+Rule is now: `Profile: Any` ✓
 
-## Fix
-```powershell
-# Make the SSH rule apply to all profiles
-Set-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -Profile Any
-# If that rule doesn't exist, try:
-Get-NetFirewallRule -DisplayName *ssh* | Set-NetFirewallRule -Profile Any
-# Nuclear option — create a new rule covering all profiles:
-New-NetFirewallRule -Name sshd_all -DisplayName 'OpenSSH Server (all profiles)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -Profile Any
+## Test Results
+
+- `Test-NetConnection localhost:22` → TcpTestSucceeded: True ✓
+- Ping 192.168.1.108 → "Destination host unreachable" (likely ICMP blocked on Razer, not a routing issue)
+
+## Action Required
+
+Try SSH again from the Razer:
+```bash
+ssh clayi@192.168.1.195
 ```
 
-## Report back
-Commit results to this file. Include:
-1. Output of each diagnostic command
-2. Which firewall profile is active
-3. Whether the fix worked (can you `Test-NetConnection -ComputerName localhost -Port 22`?)
+Should work now. If still failing, let me know the exact error message.
